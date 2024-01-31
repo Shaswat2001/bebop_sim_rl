@@ -4,31 +4,30 @@ from std_msgs.msg import String
 from math import pi
 from gym import spaces
 import numpy as np
-import threading
 import time
-from gazebo_msgs.srv import GetLinkState
+from laser_assembler.srv import AssembleScans
+from gazebo_msgs.srv import SetLinkState
+from gazebo_msgs.msg import LinkState
 from sensor_msgs.msg import LaserScan
-from geometry_msgs.msg import Twist
+import tf
 
-from std_srvs.srv import Empty
+import tf2_ros
+import geometry_msgs.msg
 
-class BaseGazeboUAVVelObsEnv1(gym.Env):
+class BaseGazeboUAVVelObsEnv1PCD(gym.Env):
     
     def __init__(self,controller = None): 
         
-        self.uam_publisher = rospy.ServiceProxy('/gazebo/get_link_state', GetLinkState)
+        self.uam_publisher = rospy.ServiceProxy('/gazebo/set_link_state', SetLinkState)
         self.lidar_subscriber = rospy.Subscriber('/laser_controller/out', LaserScan, self.lidar_callback)
-        self.twist_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-        # self.uam_publisher = UavClientAsync()
-        # self.lidar_subscriber = LidarSubscriber()
+        self.pointcloud_subscriber = rospy.ServiceProxy('assemble_scans', AssembleScans)
         # self.collision_sub = CollisionSubscriber()
 
         self.state = None
-        self.state_size = 363
+        self.state_size = 1083
         self.action_max = np.array([0.3,0.3,0.3])
 
         self.pointcloud_data = np.zeros((360,3))
-
         self.lidar_range = None
         
         self.q = None
@@ -66,9 +65,13 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
         self.vel = self.vel + action[:3]
 
         self.vel = np.clip(self.vel,self.min_q_bound,self.max_q_bound)
-        self.publish_vel(self.vel)
-        self.pose = self.get_pose()
-        lidar,self.check_contact = self.get_lidar_data()
+        self.pose = np.array([self.dt*self.vel[i] + self.pose[i] for i in range(self.vel.shape[0])])
+        self.pose = np.clip(self.pose,np.array([-12,-12,0.5]),np.array([12,12,3]))
+        self.publish_simulator(self.pose)
+        self.send_tf(self.pose)
+
+        _,self.check_contact = self.get_lidar_data()
+        
         # self.check_contact = self.collision_sub.get_collision_info()
 
         # print(f"New pose : {new_q}")
@@ -82,12 +85,16 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
         info = self.get_info(constraint)
 
         if done:
+
+            self.publish_simulator(np.array([0.0,0.0,2.0]))
+            
             print(f"The constraint is broken : {self.const_broken}")
             print(f"The position error at the end : {self.pose_error}")
             print(f"The end pose of UAV is : {self.pose[:3]}")
 
+        pcd = self.get_pointcloud()
         pose_diff = self.q_des - self.pose
-        prp_state = np.concatenate((pose_diff,lidar))
+        prp_state = np.concatenate((pose_diff,pcd))
         prp_state = prp_state.reshape(1,-1)
         self.current_time += 1
 
@@ -95,6 +102,7 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
 
             self.get_safe_pose()
             self.publish_simulator(self.previous_pose)
+            self.pose = self.previous_pose
 
             # self.reset_sim.send_request(uav_pos_ort)
 
@@ -107,7 +115,7 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
         
         done = False
         pose_error = self.pose_error
-
+        reward = 0
         if not self.const_broken:
             self.previous_pose = self.pose
             # if pose_error < 0.01:
@@ -127,7 +135,8 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
         
         else:
             reward = -20
-            # done = True
+            if self.algorithm == "SAC" and self.algorithm == "SoftQ":
+                done = True
 
         if self.current_time > self.max_time:
             done = True
@@ -192,9 +201,9 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
     def reset(self):
 
         #initial conditions
-        self.pose = np.array([0,0,1])
+        self.pose = np.array([0,0,2])
         self.vel = np.array([0,0,0])
-        self.previous_pose = np.array([0,0,1])
+        self.previous_pose = np.array([0,0,2])
         # self.qdot = np.array([0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01]) #initial velocity [x; y; z] in inertial frame - m/s
         
         self.q_des = np.random.randint([-1,-1,1],[2,2,4])
@@ -202,13 +211,14 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
         # self.qdot_des = np.zeros(self.qdot.shape)
         # self.qdotdot_des = np.zeros(self.qdot.shape)
         print(f"The target pose is : {self.q_des}")
-
-        self.publish_vel(self.vel)
-        lidar,self.check_contact = self.get_lidar_data()
+        self.publish_simulator(self.pose)
+        self.send_tf(self.pose)
+        _,self.check_contact = self.get_lidar_data()
+        pcd = self.get_pointcloud()
         # print(f"the man pose : {self.man_pos}")
         pose_diff = self.q_des - self.pose
         # pose_diff = np.clip(self.q_des - self.man_pos,np.array([-1,-1,-1]),np.array([1,1,1]))
-        prp_state = np.concatenate((pose_diff,lidar))
+        prp_state = np.concatenate((pose_diff,pcd))
         prp_state = prp_state.reshape(1,-1)
         self.current_time = 0
         self.const_broken = False
@@ -217,13 +227,15 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
 
         return prp_state
     
-    def reset_test(self,q_des,max_time):
+    def reset_test(self,q_des,max_time,algorithm):
 
         #initial conditions
-        self.pose = np.array([0,0,1])
+        self.pose = np.array([0.0,0.0,2.0])
+        # self.pose = np.array([0.0,0.0,2.0])
         self.vel = np.array([0,0,0])
-        # self.qdot = np.array([0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01,0.01]) #initial velocity [x; y; z] in inertial frame - m/s
-        
+        self.previous_pose = self.pose
+        self.algorithm = algorithm
+
         self.q_des = q_des
         self.max_time = max_time
         # self.check_contact = False
@@ -231,12 +243,13 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
         # self.qdotdot_des = np.zeros(self.qdot.shape)
         print(f"The target pose is : {self.q_des}")
 
-        self.publish_vel(self.vel)
-        lidar,self.check_contact = self.get_lidar_data()
+        self.publish_simulator(self.pose)
+        _,self.check_contact = self.get_lidar_data()
+        pcd = self.get_pointcloud()
         # print(f"the man pose : {self.man_pos}")
         pose_diff = self.q_des - self.pose
         # pose_diff = np.clip(self.q_des - self.man_pos,np.array([-1,-1,-1]),np.array([1,1,1]))
-        prp_state = np.concatenate((pose_diff,lidar))
+        prp_state = np.concatenate((pose_diff,pcd))
         prp_state = prp_state.reshape(1,-1)
         self.current_time = 0
         self.const_broken = False
@@ -244,10 +257,22 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
 
         return prp_state
     
+    def publish_simulator(self,q):
+
+        base_link_state = LinkState()
+        base_link_state.link_name = "base_link"
+        base_link_state.pose.position.x = q[0]
+        base_link_state.pose.position.y = q[1]
+        base_link_state.pose.position.z = q[2]
+
+        base_link_state.pose.orientation.w = 1
+
+        response = self.uam_publisher(base_link_state)
+
     def lidar_callback(self, msg):
 
         self.lidar_range = msg.ranges
-
+    
     def get_state(self):
 
         if self.lidar_range is None:
@@ -262,34 +287,69 @@ class BaseGazeboUAVVelObsEnv1(gym.Env):
                 contact = True
 
         return lidar_data,contact
-    
-    def publish_vel(self,vel):
-
-        vel_twist = Twist()
-        vel_twist.linear.x = vel[0]
-        vel_twist.linear.y = vel[1]
-        vel_twist.linear.z = vel[2]
-        self.twist_pub.publish(vel_twist)
-
-        time.sleep(0.14)
-    
-    def get_pose(self):
-
-        response = self.uam_publisher("bebop::base_link","ground_plane::link")
-        response = response.link_state
-
-        return np.array([response.pose.position.x,response.pose.position.y,response.pose.position.z])
-
+        
     def get_lidar_data(self):
 
         data,contact = self.get_state()
         return data,contact
     
+    def get_pointcloud(self):
+
+        resp = self.pointcloud_subscriber(rospy.Time(0,0), rospy.get_rostime())
+
+        if len(resp.cloud.points) == 0:
+            return self.pointcloud_data.reshape(-1)
+        
+        points = np.array([[point.x,point.y,point.z] for point in resp.cloud.points])
+
+        self.pointcloud_data[:points.shape[0],:] = points[:360,:]
+        self.pointcloud_data[points.shape[0]:,:] = self.pointcloud_data[0,:]
+
+        pcd = self.pointcloud_data.reshape(-1)
+
+        return pcd
+    
+    def send_tf(self,q):
+
+        broadcaster = tf2_ros.StaticTransformBroadcaster()
+        static_transformStamped = geometry_msgs.msg.TransformStamped()
+
+        static_transformStamped.header.stamp = rospy.Time.now()
+        static_transformStamped.header.frame_id = "world"
+        static_transformStamped.child_frame_id = "base_link"
+
+        static_transformStamped.transform.translation.x = float(q[0])
+        static_transformStamped.transform.translation.y = float(q[1])
+        static_transformStamped.transform.translation.z = float(q[2])
+
+        static_transformStamped.transform.rotation.x = 0
+        static_transformStamped.transform.rotation.y = 0
+        static_transformStamped.transform.rotation.z = 0
+        static_transformStamped.transform.rotation.w = 1
+
+        broadcaster.sendTransform(static_transformStamped)
+    
     def get_safe_pose(self):
 
-        for i in range(len(self.previous_pose) - 1):
+        # for i in range(len(self.previous_pose) - 1):
 
-            if self.previous_pose[i] < 0:
-                self.previous_pose[i]+= 0.05
+        py = self.pose[1] - self.previous_pose[1]
+        px = self.pose[0] - self.previous_pose[0]
+
+        if (py > 0 and px > 0) or (py < 0 and px < 0):
+
+            if py > 0:
+                self.previous_pose[0]+= 0.05
+                self.previous_pose[1]-= 0.05
             else:
-                self.previous_pose[i]-= 0.05
+                self.previous_pose[0]-= 0.05
+                self.previous_pose[1]+= 0.05
+
+        else:
+
+            if py > 0:
+                self.previous_pose[0]-= 0.05
+                self.previous_pose[1]-= 0.05
+            else:
+                self.previous_pose[0]+= 0.05
+                self.previous_pose[1]+= 0.05

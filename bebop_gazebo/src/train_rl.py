@@ -6,9 +6,7 @@ import argparse
 import sys
 import numpy as np
 import rospy
-import time
 import matplotlib.pyplot as plt
-from geometry_msgs.msg import Twist
 # sys.path.insert(0, '/Users/shaswatgarg/Documents/WaterlooMASc/StateSpaceUAV')
 
 from rl_aerial_manipulation.agent import DDPG,TD3,SAC,SoftQ,RCRL,SEditor,USL,SAAC,IDEA1,IDEA2,IDEA3,IDEA4
@@ -21,8 +19,14 @@ from rl_aerial_manipulation.replay_buffer.Constraint_RB import ConstReplayBuffer
 from rl_aerial_manipulation.exploration.OUActionNoise import OUActionNoise
 from rl_aerial_manipulation.controllers.PID import CascadeController
 
+from rl_aerial_manipulation.environment.Quadrotor.QuadrotorObsEnv import QuadrotorObsEnv
+from rl_aerial_manipulation.environment.Quadrotor.BaseQuadrotorEnv import BaseQuadrotorEnv
+from rl_aerial_manipulation.environment.Quadrotor.QuadrotorTeachEnv import QuadrotorTeachEnv
+from rl_aerial_manipulation.environment.GazeboEnv.Quadrotor.BaseGazeboUAVVelObsEnv1 import BaseGazeboUAVVelObsEnv1
 from rl_aerial_manipulation.environment.GazeboEnv.Quadrotor.BaseGazeboUAVVelObsEnv1PCD import BaseGazeboUAVVelObsEnv1PCD
-# from rl_aerial_manipulation.teacher import TeacherController
+from rl_aerial_manipulation.environment.PyBulletEnv.UAM.BaseUAMEnv import BaseUAMEnv
+from rl_aerial_manipulation.environment.PyBulletEnv.UAM.BaseUAMObsEnv import BaseUAMObsEnv
+from rl_aerial_manipulation.environment.PyBulletEnv.Quadrotor.BaseUAVEnv import BaseUAVEnv
 
 def build_parse():
 
@@ -34,7 +38,7 @@ def build_parse():
     parser.add_argument("max_action",nargs="?",type=float,default=[],help="Max possible value of action")
     parser.add_argument("min_action",nargs="?",type=float,default=[],help="Min possible value of action")
 
-    parser.add_argument("Algorithm",nargs="?",type=str,default="DDPG",help="Name of RL algorithm")
+    parser.add_argument("Algorithm",nargs="?",type=str,default="TD3",help="Name of RL algorithm")
     parser.add_argument('tau',nargs="?",type=float,default=0.005)
     parser.add_argument('gamma',nargs="?",default=0.99)
     parser.add_argument('actor_lr',nargs="?",type=float,default=0.0001,help="Learning rate of Policy Network")
@@ -43,7 +47,8 @@ def build_parse():
 
     parser.add_argument("mem_size",nargs="?",type=int,default=100000,help="Size of Replay Buffer")
     parser.add_argument("batch_size",nargs="?",type=int,default=64,help="Batch Size used during training")
-    parser.add_argument("n_episodes",nargs="?",type=int,default=50000,help="Total number of episodes to train the agent")
+    parser.add_argument("n_episodes",nargs="?",type=int,default=10000,help="Total number of episodes to train the agent")
+    parser.add_argument("n_batches",nargs="?",type=int,default=1,help="Total number of times the RL needs to be replicated")
     parser.add_argument("target_update",nargs="?",type=int,default=2,help="Iterations to update the target network")
     parser.add_argument("vision_update",nargs="?",type=int,default=5,help="Iterations to update the vision network")
     parser.add_argument("delayed_update",nargs="?",type=int,default=100,help="Iterations to update the second target network using delayed method")
@@ -98,34 +103,100 @@ def build_parse():
 
     return args
 
-def test(args,env,agent,teacher):
+def train(args,env,agent,teacher):
 
-    s = env.reset_test(np.array([1,1,2]),35)
-    agent.load(args.Environment)
-    twist_pub = rospy.Publisher("/cmd_vel", Twist, queue_size=1)
-    start_time = time.time()
-    # for _ in range(200):
-    while True:
-        # s = s.reshape(1,s.shape[0])
-        action = agent.choose_action(s,"testing")
-        next_state,rwd,done,info = env.step(action)
-        print(env.vel)
-        # print(next_state)
-        if done:
-            break
+    best_reward = -np.inf
+    total_reward = []
+    total_safe_reward = []
+    avg_reward_list = []
+    constraint_violation = []
+    os.makedirs("config/saves/rl_rewards/" +args.Environment, exist_ok=True)
+    os.makedirs("config/saves/images/" +args.Environment, exist_ok=True)
+    
+    ep_len = 0
+    constraint_broke = 0
+    for i in range(args.n_episodes):
+        if teacher is not None:
+            teacher.generate_env_param()
+        s = env.reset()
+        reward = 0
+        safe_reward = 0
         
-        # vel = Twist()
-        # vel.linear.x = env.vel[0]
-        # vel.linear.y = env.vel[1]
-        # vel.linear.z = env.vel[2]
-        # twist_pub.publish(vel)
-        s = next_state
-        # time.sleep(0.1)
-        # print(env.check_contact)
+        # for _ in range(200):
+        while True:
+            # s = s.reshape(1,s.shape[0])
+            if env.check_contact: 
+                env.max_time = 20
+                action = -0.1 + 0.2*np.random.sample(size=(1,3))
+            else:
+                action = agent.choose_action(s)
+            # action = agent.choose_action(s)
+            next_state,rwd,done,info = env.step(action)
+            ep_len+=1
+            if info["constraint"] > 0:
+                constraint_broke+=1
+            if args.Algorithm == "RCRL":
+                constraint = info["constraint"]
+            elif args.Algorithm == "SAAC" or args.Algorithm == "USL" or "IDEA" in args.Algorithm:
+                constraint = info["safe_cost"]
+            # elif "IDEA" in args.Algorithm:
+            #     constraint = info["engage_reward"]
+            else:
+                constraint = info["negative_safe_cost"]
+
+            agent.add(s,action,rwd,constraint,next_state,done)
+            agent.learn()
+            reward+=rwd
+            safe_reward+=constraint
+            # print(next_state)
+            if done:
+                if teacher:
+                    teacher.record_train_episode(reward, ep_len)
+                    teacher.dump("config/saves/training_weights/"+args.Environment +"/teacher_weights/"+args.Algorithm+"_"+args.teach_alg+".pkl")
+                if args.Algorithm == "IDEA1" or args.Algorithm == "IDEA3" or args.Algorithm == "IDEA4":
+                    agent.safe_policy_called = 0
+                break
+                
+            s = next_state
+
+        total_reward.append(reward)
+        avg_reward = np.mean(total_reward[-40:])
+        total_safe_reward.append(safe_reward)
+        avg_safe_reward = np.mean(total_safe_reward[-40:])
+        constraint_violation.append(constraint_broke/ep_len)
+        if avg_reward>best_reward and i > 10:
+            best_reward=avg_reward
+            if args.save_rl_weights:
+                print("Weights Saved !!!")
+                agent.save(args.Environment)
+
+        print("Episode * {} * Avg Reward is ==> {}".format(i, avg_reward))
+        print("Episode * {} * Constraint percentage is ==> {}".format(i,constraint_broke/ep_len))
+        print("Episode * {} * Avg Safe Reward is ==> {}".format(i, avg_safe_reward))
+        avg_reward_list.append(avg_reward)
+
+    if args.save_results:
+        list_cont_rwd = [avg_reward_list,constraint_violation,avg_safe_reward]
+        f = open("config/saves/rl_rewards/" +args.Environment + "/" + args.Algorithm + ".pkl","wb")
+        pickle.dump(list_cont_rwd,f)
+        f.close()
+    
+    plt.figure()
+    plt.subplot(211)
+    plt.title(f"Constraint Violation (%) - {args.Algorithm}")
+    plt.ylabel("Constraint Violation (%)")
+    plt.plot(constraint_violation)
+
+    plt.subplot(212)
+    plt.title(f"Reward values - {args.Algorithm}")
+    plt.xlabel("Iterations")
+    plt.ylabel("Reward")
+    plt.plot(avg_reward_list)
+    plt.show()
 
 if __name__=="__main__":
 
-    rospy.init_node('test_rl')
+    rospy.init_node('train_rl')
 
     args = build_parse()
 
@@ -133,33 +204,22 @@ if __name__=="__main__":
     param_bound["n_obstacles"] = [0,args.max_obstacles]
     param_bound["obs_centre"] = [0,args.obs_region,3]
 
-    # if "quadrotor_obs" == args.Environment:
-    #     env = QuadrotorObsEnv(controller=CascadeController)
-    # elif "quadrotor_teach" == args.Environment:
-    #     env = QuadrotorTeachEnv(controller=CascadeController,load_obstacle=False)
-    # elif "uam_gazebo" == args.Environment:
-    #     env = BaseGazeboUAMEnv(controller=None)
-    # elif "uam_gazebo_obs" == args.Environment:
-    #     env = BaseGazeboUAMObsEnv(controller=CascadeController)
-    # elif "uam_gazebo_px4" == args.Environment:
-    #     env = BaseGazeboUAMPX4Env(controller=CascadeController)
-    # elif "uav_pybullet" == args.Environment:
-    #     env = BaseUAVEnv(controller=CascadeController)
-    # elif "uam_pybullet" == args.Environment:
-    #     env = BaseUAMEnv(controller=CascadeController)
-    # elif "uam_pybullet_obs" == args.Environment:
-    #     env = BaseUAMObsEnv(controller=CascadeController)
-    # elif "uav_gazebo" == args.Environment:
-    #     env = BaseGazeboUAVEnv(controller=CascadeController)
-    # elif "uav_obs_gazebo" == args.Environment:
-    #     env = BaseGazeboUAVObsEnv(controller=CascadeController)
-    # elif "uav_vel_gazebo" == args.Environment:
-    #     env = BaseGazeboUAVVelEnv(controller=CascadeController)
-    # elif "uav_vel_obs_gazebo" == args.Environment:
-    #     env = BaseGazeboUAVVelObsEnv(controller=CascadeController)
-    env = BaseGazeboUAVVelObsEnv1PCD(controller=CascadeController)
-    # else:
-    #     env = BaseQuadrotorEnv(controller=CascadeController)
+    if "quadrotor_obs" == args.Environment:
+        env = QuadrotorObsEnv(controller=CascadeController)
+    elif "quadrotor_teach" == args.Environment:
+        env = QuadrotorTeachEnv(controller=CascadeController,load_obstacle=False)
+    elif "uav_pybullet" == args.Environment:
+        env = BaseUAVEnv(controller=CascadeController)
+    elif "uam_pybullet" == args.Environment:
+        env = BaseUAMEnv(controller=CascadeController)
+    elif "uam_pybullet_obs" == args.Environment:
+        env = BaseUAMObsEnv(controller=CascadeController)
+    elif "uav_vel_obs_gazebo1" == args.Environment:
+        env = BaseGazeboUAVVelObsEnv1(controller=CascadeController)
+    elif "uav_vel_obs_gazebo1pcd" == args.Environment:
+        env = BaseGazeboUAVVelObsEnv1PCD(controller=CascadeController)
+    else:
+        env = BaseQuadrotorEnv(controller=CascadeController)
 
     if args.enable_vision:
         vision_model = FeatureExtractor(None,None,12)
@@ -201,10 +261,9 @@ if __name__=="__main__":
     elif args.Algorithm == "IDEA4":
         agent = IDEA4.IDEA4(args = args,policy = PolicyNetwork,critic = QNetwork,nvp=RealNVP,replayBuff = CostReplayBuffer,exploration = OUActionNoise)
 
-    # if "teach" in args.Environment:
+    if "teach" in args.Environment:
+        teacher = None
+    else:
+        teacher = None
 
-    #     # teacher = TeacherController.TeacherController(param_bound,env,args)
-    # else:
-    teacher = None
-
-    test(args,env,agent,teacher)
+    train(args,env,agent,teacher)

@@ -43,4 +43,8 @@
 
   <node pkg="rostopic" type="rostopic" name="takeoffbaby" args="pub /action/takeoff/goal hector_uav_msgs/TakeoffActionGoal '{header: { seq: 0, stamp: { secs: 0, nsecs: 0 }, frame_id: '' }, goal_id: {stamp: { secs: 0, nsecs: 0}, id: ''}, goal: {} }'" output="screen"/>
 
+  <node pkg="laser_assembler" type="laser_scan_assembler" name="laser_assembler">
+      <param name="max_scans" type="int" value="10" />
+      <param name="fixed_frame" type="string" value="world" />
+  </node>
 </launch>
